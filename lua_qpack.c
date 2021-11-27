@@ -9,6 +9,8 @@
 #include <lua.h>
 #include <lauxlib.h>
 
+int siri_err;
+
 #ifndef QPACK_MODNAME
 #define QPACK_MODNAME   "qpack"
 #endif
@@ -183,14 +185,15 @@ static void qpack_encode_exception(lua_State *l, qpack_config_t *cfg, qp_packer_
  * - String (Lua stack index)
  *
  * Returns nothing. Doesn't remove string from Lua stack */
-static void qpack_append_string(lua_State *l, qp_packer_t *pk, int lindex)
+static int qpack_append_string(lua_State *l, qp_packer_t *pk, int lindex)
 {
     const char *str;
     size_t len;
 
     str = lua_tolstring(l, lindex, &len);
+    // printf("%s: append string:%s len:%lu\n", __func__, str, len);
 
-    qp_add_string_term_n(pk, str, len);
+    return qp_add_string_term_n(pk, str, len);
 }
 
 /* Find the size of the array on the top of the Lua stack
@@ -326,17 +329,18 @@ static int qpack_append_object(lua_State *l, qpack_config_t *cfg,
 static void qpack_append_data(lua_State *l, qpack_config_t *cfg,
                                 int current_depth, qp_packer_t *pk)
 {
-    int len;
+    int len, ret = 0;
+    int dtype = lua_type(l, -1);
 
-    switch (lua_type(l, -1)) {
+    switch (dtype) {
     case LUA_TSTRING:
-        qpack_append_string(l, pk, -1);
+        ret = qpack_append_string(l, pk, -1);
         break;
     case LUA_TNUMBER:
-        qpack_append_number(l, cfg, pk, -1);
+        ret = qpack_append_number(l, cfg, pk, -1);
         break;
     case LUA_TBOOLEAN:
-        qpack_append_bool(l, cfg, pk, -1);
+        ret = qpack_append_bool(l, cfg, pk, -1);
         break;
     case LUA_TTABLE:
         current_depth++;
@@ -349,21 +353,21 @@ static void qpack_append_data(lua_State *l, qpack_config_t *cfg,
             }
             len = lua_tointeger(l, -1);
             lua_pop(l, 1);
-            qpack_append_array(l, cfg, current_depth, pk, len);
+            ret = qpack_append_array(l, cfg, current_depth, pk, len);
         } else {
             len = lua_array_length(l, cfg, pk);
             if (len > 0 || (cfg->encode_empty_table_as_array && len == 0))
-                qpack_append_array(l, cfg, current_depth, pk, len);
+                ret = qpack_append_array(l, cfg, current_depth, pk, len);
             else
-                qpack_append_object(l, cfg, current_depth, pk);
+                ret = qpack_append_object(l, cfg, current_depth, pk);
         }
         break;
     case LUA_TNIL:
-        qpack_append_null(l, cfg, pk, -1);
+        ret = qpack_append_null(l, cfg, pk, -1);
         break;
     case LUA_TLIGHTUSERDATA:
         if (lua_touserdata(l, -1) == NULL) {
-            qpack_append_null(l, cfg, pk, -1);
+            ret = qpack_append_null(l, cfg, pk, -1);
             break;
         }
     default:
@@ -371,6 +375,9 @@ static void qpack_append_data(lua_State *l, qpack_config_t *cfg,
          * and LUA_TLIGHTUSERDATA) cannot be serialised */
         qpack_encode_exception(l, cfg, pk, -1, "type not supported");
         /* never returns */
+    }
+    if (ret) {
+        luaL_error(l, "encode data type:%d failed err:%d", dtype, ret);
     }
 }
 
@@ -419,7 +426,7 @@ static int qpack_process_obj(lua_State *l, qpack_parse_t *pk,
         lua_pushboolean(l, 0);
         break;
     case QP_RAW:
-        lua_pushlstring(l, (const char*)obj->via.raw, obj->len);
+        lua_pushlstring(l, (const char*)obj->via.raw, obj->len - 1);
         break;
     case QP_NULL:
         lua_pushlightuserdata(l, NULL);
@@ -432,7 +439,7 @@ static int qpack_process_obj(lua_State *l, qpack_parse_t *pk,
     case QP_ARRAY5:
     {
         lua_newtable(l);
-        for (int i = 0; i < obj->tp - QP_ARRAY0; i++)
+        for (int i = i; i <= obj->tp - QP_ARRAY0; i++)
         {
             qp_next(up, obj);
             ret = qpack_process_obj(l, pk, up, obj);
@@ -471,7 +478,7 @@ static int qpack_process_obj(lua_State *l, qpack_parse_t *pk,
     case QP_ARRAY_OPEN:
     {
         lua_newtable(l);
-        size_t i = 0;
+        size_t i = 1;
 
         while(qp_next(up, obj) && obj->tp != QP_ARRAY_CLOSE)
         {
@@ -523,15 +530,17 @@ static int qpack_decode(lua_State *l)
     luaL_argcheck(l, lua_gettop(l) == 1, 1, "expected 1 argument");
 
     qpack.cfg = qpack_fetch_config(l);
+
     qpack.data = luaL_checklstring(l, 1, &qpack_len);
 
     qp_unpacker_init(&up, (unsigned char*)qpack.data, qpack_len);
 
     qp_next(&up, &obj);
-    if (obj.tp != QP_END) 
+    if (obj.tp == QP_END) {
         luaL_error(l, "QPACK cannot parse empty string");
-
-    qpack_process_obj(l, &qpack, &up, &obj);
+    } else {
+        qpack_process_obj(l, &qpack, &up, &obj);
+    }
 
     return 1;
 }
