@@ -13,12 +13,12 @@
 ##### Build defaults #####
 LUA_VERSION =       5.3
 TARGET =            qpack.so
-PREFIX =            /usr/local
+PREFIX =            /usr
 #CFLAGS =            -g -Wall -pedantic -fno-inline
 CFLAGS =            -O3 -Wall -pedantic -DNDEBUG
 QPACK_CFLAGS =      -fpic
 QPACK_LDFLAGS =     -shared
-LUA_INCLUDE_DIR =   $(PREFIX)/include
+LUA_INCLUDE_DIR =   $(PREFIX)/include/lua5.3
 LUA_CMODULE_DIR =   $(PREFIX)/lib/lua/$(LUA_VERSION)
 LUA_MODULE_DIR =    $(PREFIX)/share/lua/$(LUA_VERSION)
 LUA_BIN_DIR =       $(PREFIX)/bin
@@ -60,7 +60,7 @@ DATAPERM =          644
 EXECPERM =          755
 
 BUILD_CFLAGS =      -I$(LUA_INCLUDE_DIR) -I. $(QPACK_CFLAGS)
-OBJS =              lua_qpack.o qpack.o 
+OBJS =              lua_qpack.o qpack/qpack.o 
 
 .PHONY: all clean install install-extra doc
 

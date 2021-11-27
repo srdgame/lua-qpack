@@ -11,9 +11,25 @@
 #include <stdarg.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <logger/logger.h>
+#include <signal.h>
+// #include <logger/logger.h>
 #include <assert.h>
-#include <siri/err.h>
+// #include <siri/err.h>
+
+#define log_error printf
+#define log_critical printf
+
+/* value should be 0,
+ * any other value indicates a critical error has occurred */
+extern int siri_err;
+
+#define ERR_ALLOC                                           \
+log_critical("Memory allocation error at: %s:%d (%s)",      \
+        __FILE__, __LINE__, __func__);                      \
+raise(SIGSEGV);                                             \
+if (!siri_err) siri_err = SIGSEGV;
+
+
 
 
 #define QPACK_MAX_FMT_SIZE 1024

@@ -1,7 +1,7 @@
 /* Lua QPack - QPack support for Lua
  */
 
-#include <qpack.h>
+#include <qpack/qpack.h>
 #include <assert.h>
 #include <string.h>
 #include <math.h>
@@ -41,9 +41,7 @@ typedef struct {
 typedef struct {
     const char *data;
     const char *ptr;
-    strbuf_t *tmp;    /* Temporary storage for strings */
     qpack_config_t *cfg;
-    int current_depth;
 } qpack_parse_t;
 
 /* ===== CONFIGURATION ===== */
@@ -73,6 +71,50 @@ static qpack_config_t *qpack_arg_init(lua_State *l, int args)
     return qpack_fetch_config(l);
 }
 
+/* Process integer options for configuration functions */
+static int qpack_integer_option(lua_State *l, int optindex, int *setting,
+                               int min, int max)
+{
+    char errmsg[64];
+    int value;
+
+    if (!lua_isnil(l, optindex)) {
+        value = luaL_checkinteger(l, optindex);
+        snprintf(errmsg, sizeof(errmsg), "expected integer between %d and %d", min, max);
+        luaL_argcheck(l, min <= value && value <= max, 1, errmsg);
+        *setting = value;
+    }
+
+    lua_pushinteger(l, *setting);
+
+    return 1;
+}
+
+/* Process enumerated arguments for a configuration function */
+static int qpack_enum_option(lua_State *l, int optindex, int *setting,
+                            const char **options, int bool_true)
+{
+    static const char *bool_options[] = { "off", "on", NULL };
+
+    if (!options) {
+        options = bool_options;
+        bool_true = 1;
+    }
+
+    if (!lua_isnil(l, optindex)) {
+        if (bool_true && lua_isboolean(l, optindex))
+            *setting = lua_toboolean(l, optindex) * bool_true;
+        else
+            *setting = luaL_checkoption(l, optindex, NULL, options);
+    }
+
+    if (bool_true && (*setting == 0 || *setting == bool_true))
+        lua_pushboolean(l, *setting);
+    else
+        lua_pushstring(l, options[*setting]);
+
+    return 1;
+}
 /* Configures the maximum number of nested arrays/objects allowed when
  * encoding */
 static int qpack_cfg_encode_max_depth(lua_State *l)
@@ -99,23 +141,38 @@ static int qpack_cfg_encode_empty_tables_as_array(lua_State *l)
 
 static int qpack_destroy_config(lua_State *l)
 {
+    /*
     qpack_config_t *cfg;
 
     cfg = (qpack_config_t *)lua_touserdata(l, 1);
-    if (cfg)
-        strbuf_free(&cfg->encode_buf);
     cfg = NULL;
+    */
 
     return 0;
 }
 
+static void qpack_create_config(lua_State *l)
+{
+    qpack_config_t *cfg;
+
+    cfg = (qpack_config_t *)lua_newuserdata(l, sizeof(*cfg));
+
+    /* Create GC method to clean up strbuf */
+    lua_newtable(l);
+    lua_pushcfunction(l, qpack_destroy_config);
+    lua_setfield(l, -2, "__gc");
+    lua_setmetatable(l, -2);
+
+    cfg->encode_max_depth = DEFAULT_ENCODE_MAX_DEPTH;
+    cfg->decode_max_depth = DEFAULT_DECODE_MAX_DEPTH;
+    cfg->encode_empty_table_as_array = DEFAULT_ENCODE_EMPTY_TABLE_AS_ARRAY;
+}
+
 /* ===== ENCODING ===== */
 
-static void qpack_encode_exception(lua_State *l, qp_packer_t *pk, int lindex,
+static void qpack_encode_exception(lua_State *l, qpack_config_t *cfg, qp_packer_t *pk, int lindex,
                                   const char *reason)
 {
-    if (!cfg->encode_keep_buffer)
-        strbuf_free(qpack);
     luaL_error(l, "Cannot serialise %s: %s",
                   lua_typename(l, lua_type(l, lindex)), reason);
 }
@@ -140,7 +197,7 @@ static void qpack_append_string(lua_State *l, qp_packer_t *pk, int lindex)
  * -1   object (not a pure array)
  * >=0  elements in array
  */
-static int lua_array_length(lua_State *l, qp_packer_t *pk)
+static int lua_array_length(lua_State *l, qpack_config_t *cfg, qp_packer_t *pk)
 {
     double k;
     int max;
@@ -170,70 +227,59 @@ static int lua_array_length(lua_State *l, qp_packer_t *pk)
         return -1;
     }
 
-    /* Encode excessively sparse arrays as objects (if enabled) */
-    if (cfg->encode_sparse_ratio > 0 &&
-        max > items * cfg->encode_sparse_ratio &&
-        max > cfg->encode_sparse_safe) {
-        if (!cfg->encode_sparse_convert)
-            qpack_encode_exception(l, cfg, qpack, -1, "excessively sparse array");
-
-        return -1;
-    }
-
     return max;
 }
 
-static void qpack_check_encode_depth(lua_State *l, int current_depth, qp_packer_t *pk)
+static void qpack_check_encode_depth(lua_State *l, qpack_config_t *cfg, int current_depth, qp_packer_t *pk)
 {
-    if (current_depth <= DEFAULT_ENCODE_MAX_DEPTH  && lua_checkstack(l, 3))
+    if (current_depth <= cfg->encode_max_depth  && lua_checkstack(l, 3))
         return;
-
-    if (!cfg->encode_keep_buffer)
-        strbuf_free(qpack);
 
     luaL_error(l, "Cannot serialise, excessive nesting (%d)",
                current_depth);
 }
 
-static void qpack_append_data(lua_State *l, int current_depth, qp_packer_t *pk);
+static void qpack_append_data(lua_State *l, qpack_config_t *cfg, int current_depth, qp_packer_t *pk);
 
 /* qpack_append_array args:
  * - lua_State
  * - JSON strbuf
  * - Size of passwd Lua array (top of stack) */
-static int qpack_append_array(lua_State *l, int current_depth,
+static int qpack_append_array(lua_State *l, qpack_config_t *cfg, int current_depth,
                               qp_packer_t *pk, int array_length)
 {
-    int comma, ret;
+    int ret, i;
     ret = qp_add_type(pk, QP_ARRAY_OPEN);
     if (ret)
-        return ret
+        return ret;
 
     for (i = 1; i <= array_length; i++) {
         lua_geti(l, -1, i);
-        qpack_append_data(l, cfg, current_depth, qpack);
+        qpack_append_data(l, cfg, current_depth, pk);
         lua_pop(l, 1);
     }
 
     return qp_add_type(pk, QP_ARRAY_CLOSE);
 }
 
-static int qpack_append_null(lua_State *l, qp_packer_t *pk, int lindex)
+static int qpack_append_null(lua_State *l, qpack_config_t *cfg,
+        qp_packer_t *pk, int lindex)
 {
-    return qp_add_null(pk)
+    return qp_add_null(pk);
 }
 
-static int qpack_append_bool(lua_State *l, qp_packer_t *pk, int lindex)
+static int qpack_append_bool(lua_State *l, qpack_config_t *cfg,
+        qp_packer_t *pk, int lindex)
 {
     if (lua_toboolean(l, -1))
-        return qp_add_true(pk)
+        return qp_add_true(pk);
     else
-        return qp_add_false(pk)
+        return qp_add_false(pk);
 }
 
-static int qpack_append_number(lua_State *l, qp_packer_t *pk, int lindex)
+static int qpack_append_number(lua_State *l, qpack_config_t *cfg,
+        qp_packer_t *pk, int lindex)
 {
-    int len;
 #if LUA_VERSION_NUM >= 503
     if (lua_isinteger(l, lindex)) {
         lua_Integer num = lua_tointeger(l, lindex);
@@ -244,30 +290,31 @@ static int qpack_append_number(lua_State *l, qp_packer_t *pk, int lindex)
     return qp_add_double(pk, num); 
 }
 
-static int qpack_append_object(lua_State *l, int current_depth, qp_packer_t *pk)
+static int qpack_append_object(lua_State *l, qpack_config_t *cfg,
+        int current_depth, qp_packer_t *pk)
 {
-    int ret;
+    int keytype, ret;
 
     ret = qp_add_type(pk, QP_MAP_OPEN);
     if (ret)
-        return ret
+        return ret;
 
     lua_pushnil(l);
     while (lua_next(l, -2) != 0) {
         /* table, key, value */
         keytype = lua_type(l, -2);
         if (keytype == LUA_TNUMBER) {
-            qpack_append_number(l, cfg, qpack, -2);
+            qpack_append_number(l, cfg, pk, -2);
         } else if (keytype == LUA_TSTRING) {
-            qpack_append_string(l, qpack, -2);
+            qpack_append_string(l, pk, -2);
         } else {
-            qpack_encode_exception(l, cfg, qpack, -2,
+            qpack_encode_exception(l, cfg, pk, -2,
                                   "table key must be a number or string");
             /* never returns */
         }
 
         /* table, key, value */
-        qpack_append_data(l, cfg, current_depth, qpack);
+        qpack_append_data(l, cfg, current_depth, pk);
         lua_pop(l, 1);
         /* table, key */
     }
@@ -276,23 +323,24 @@ static int qpack_append_object(lua_State *l, int current_depth, qp_packer_t *pk)
 }
 
 /* Serialise Lua data into QPacker string. */
-static void qpack_append_data(lua_State *l, int current_depth, qp_packer_t *pk);
+static void qpack_append_data(lua_State *l, qpack_config_t *cfg,
+                                int current_depth, qp_packer_t *pk)
 {
     int len;
 
     switch (lua_type(l, -1)) {
     case LUA_TSTRING:
-        qpack_append_string(l, qpack, -1);
+        qpack_append_string(l, pk, -1);
         break;
     case LUA_TNUMBER:
-        qpack_append_number(l, cfg, qpack, -1);
+        qpack_append_number(l, cfg, pk, -1);
         break;
     case LUA_TBOOLEAN:
-        qpack_append_bool(l, cfg, qpack, -1);
+        qpack_append_bool(l, cfg, pk, -1);
         break;
     case LUA_TTABLE:
         current_depth++;
-        qpack_check_encode_depth(l, cfg, current_depth, qpack);
+        qpack_check_encode_depth(l, cfg, current_depth, pk);
         if (luaL_getmetafield(l, -1, "__len") != LUA_TNIL) {
             lua_pushvalue(l, -2);
             lua_call(l, 1, 1);
@@ -301,77 +349,52 @@ static void qpack_append_data(lua_State *l, int current_depth, qp_packer_t *pk);
             }
             len = lua_tointeger(l, -1);
             lua_pop(l, 1);
-            qpack_append_array(l, cfg, current_depth, qpack, len);
+            qpack_append_array(l, cfg, current_depth, pk, len);
         } else {
-            len = lua_array_length(l, cfg, qpack);
+            len = lua_array_length(l, cfg, pk);
             if (len > 0 || (cfg->encode_empty_table_as_array && len == 0))
-                qpack_append_array(l, cfg, current_depth, qpack, len);
+                qpack_append_array(l, cfg, current_depth, pk, len);
             else
-                qpack_append_object(l, cfg, current_depth, qpack);
+                qpack_append_object(l, cfg, current_depth, pk);
         }
         break;
     case LUA_TNIL:
-        qpack_append_null(l, cfg, qpack, -1);
+        qpack_append_null(l, cfg, pk, -1);
         break;
     case LUA_TLIGHTUSERDATA:
         if (lua_touserdata(l, -1) == NULL) {
-            qpack_append_null(l, cfg, qpack, -1);
+            qpack_append_null(l, cfg, pk, -1);
             break;
         }
     default:
         /* Remaining types (LUA_TFUNCTION, LUA_TUSERDATA, LUA_TTHREAD,
          * and LUA_TLIGHTUSERDATA) cannot be serialised */
-        qpack_encode_exception(l, cfg, qpack, -1, "type not supported");
+        qpack_encode_exception(l, cfg, pk, -1, "type not supported");
         /* never returns */
     }
 }
 
 static int qpack_encode(lua_State *l)
 {
-    json_config_t *cfg = json_fetch_config(l)
-    qp_packer_t * packer = NULL;
+    qpack_config_t *cfg = qpack_fetch_config(l);
+    qp_packer_t * pk = NULL;
 
     luaL_argcheck(l, lua_gettop(l) == 1, 1, "expected 1 argument");
 
     /* Use private buffer */
-    packer = sirinet_packer_new(QP_SUGGESTED_SIZE);
+    pk = qp_packer_new(QP_SUGGESTED_SIZE);
 
-    qpack_append_data(l, 0, packer);
+    qpack_append_data(l, cfg, 0, pk);
 
-    qpack = strbuf_string(encode_buf, &len);
-
-    lua_pushlstring(l, packer->buffer, packer->len);
+    lua_pushlstring(l, (const char*)pk->buffer, pk->len);
 
     return 1;
 }
 
 /* ===== DECODING ===== */
 
-/* This function does not return.
- * DO NOT CALL WITH DYNAMIC MEMORY ALLOCATED.
- * The only supported exception is the temporary parser string
- * qpack->tmp struct.
- * qpack and token should exist on the stack somewhere.
- * luaL_error() will long_jmp and release the stack */
-static void qpack_throw_parse_error(lua_State *l, qpack_parse_t *qpack,
-                                   const char *exp, qpack_token_t *token)
-{
-    const char *found;
-
-    strbuf_free(qpack->tmp);
-
-    if (token->type == T_ERROR)
-        found = token->value.string;
-    else
-        found = qpack_token_type_name[token->type];
-
-    /* Note: token->index is 0 based, display starting from 1 */
-    luaL_error(l, "Expected %s but found %s at character %d",
-               exp, found, token->index + 1);
-}
-
-static int qpack_process_obj(lua_State *l, qpack_parse_t *qpack,
-        qp_unpacker_t *up, qp_obj_t *obj);
+static int qpack_process_obj(lua_State *l, qpack_parse_t *pk,
+        qp_unpacker_t *up, qp_obj_t *obj)
 {
     int ret = 0;
 
@@ -380,7 +403,7 @@ static int qpack_process_obj(lua_State *l, qpack_parse_t *qpack,
     case QP_ARRAY_CLOSE:
     case QP_MAP_CLOSE:
     case QP_END:
-        luaL_error(l, "QPACK error format");
+        luaL_error(l, "QPACK error obj->tp:%d", obj->tp);
         return -1;
         break;
     case QP_INT64:
@@ -396,7 +419,7 @@ static int qpack_process_obj(lua_State *l, qpack_parse_t *qpack,
         lua_pushboolean(l, 0);
         break;
     case QP_RAW:
-        lua_pushlstring(l, obj->via.raw, obj->len);
+        lua_pushlstring(l, (const char*)obj->via.raw, obj->len);
         break;
     case QP_NULL:
         lua_pushlightuserdata(l, NULL);
@@ -408,15 +431,13 @@ static int qpack_process_obj(lua_State *l, qpack_parse_t *qpack,
     case QP_ARRAY4:
     case QP_ARRAY5:
     {
-        size_t i = obj->tp - QP_ARRAY0;
         lua_newtable(l);
-
-        while (i--)
+        for (int i = 0; i < obj->tp - QP_ARRAY0; i++)
         {
             qp_next(up, obj);
-            ret = qpack_process_obj(l, qpack, up, obj);
+            ret = qpack_process_obj(l, pk, up, obj);
             if (ret)
-                break
+                break;
             lua_rawseti(l, -2, i);            /* arr[i] = value */
         }
         break;
@@ -428,18 +449,17 @@ static int qpack_process_obj(lua_State *l, qpack_parse_t *qpack,
     case QP_MAP4:
     case QP_MAP5:
     {
-        size_t i = obj->tp - QP_MAP0;
         lua_newtable(l);
 
-        while (i--)
+        for (int i = 0; i < obj->tp - QP_MAP0; i++)
         {
             qp_next(up, obj);
-            ret = qpack_process_obj(l, qpack, up, obj);
+            ret = qpack_process_obj(l, pk, up, obj);
             if (ret)
                 break;
 
             qp_next(up, obj);
-            ret = qpack_process_obj(l, qpack, up, obj);
+            ret = qpack_process_obj(l, pk, up, obj);
             if (ret)
                 break;
 
@@ -451,13 +471,15 @@ static int qpack_process_obj(lua_State *l, qpack_parse_t *qpack,
     case QP_ARRAY_OPEN:
     {
         lua_newtable(l);
+        size_t i = 0;
 
         while(qp_next(up, obj) && obj->tp != QP_ARRAY_CLOSE)
         {
-            ret = qpack_process_obj(l, qpack, up, obj);
+            ret = qpack_process_obj(l, pk, up, obj);
             if (ret)
                 break;
             lua_rawseti(l, -2, i);            /* arr[i] = value */
+            i++;
         }
         break;
     }
@@ -467,13 +489,13 @@ static int qpack_process_obj(lua_State *l, qpack_parse_t *qpack,
 
         while(qp_next(up, obj) && obj->tp != QP_MAP_CLOSE)
         {
-            ret = qpack_process_obj(l, qpack, up, obj);
+            ret = qpack_process_obj(l, pk, up, obj);
             if (ret)
                 break;
 
             qp_next(up, obj);
 
-            ret = qpack_process_obj(l, qpack, up, obj);
+            ret = qpack_process_obj(l, pk, up, obj);
             if (ret)
                 break;
 
@@ -484,11 +506,11 @@ static int qpack_process_obj(lua_State *l, qpack_parse_t *qpack,
     }
     default:
     {
-        ret = -1
-        qpack_throw_parse_error(l, qpack, "value", token);
+        ret = -1;
+        luaL_error(l, "QPACK unknown obj->tp:%d", obj->tp);
     }
     }
-    return ret
+    return ret;
 }
 
 static int qpack_decode(lua_State *l)
@@ -497,16 +519,13 @@ static int qpack_decode(lua_State *l)
     size_t qpack_len;
     qp_unpacker_t up;
     qp_obj_t obj;
-    int ret;
 
     luaL_argcheck(l, lua_gettop(l) == 1, 1, "expected 1 argument");
 
     qpack.cfg = qpack_fetch_config(l);
     qpack.data = luaL_checklstring(l, 1, &qpack_len);
-    qpack.current_depth = 0;
-    qpack.ptr = qpack.data;
 
-    qp_unpacker_init(&up, qpack.ptr, qpack_len);
+    qp_unpacker_init(&up, (unsigned char*)qpack.data, qpack_len);
 
     qp_next(&up, &obj);
     if (obj.tp != QP_END) 
@@ -553,12 +572,12 @@ static int lua_qpack_new(lua_State *l)
     luaL_Reg reg[] = {
         { "encode", qpack_encode },
         { "decode", qpack_decode },
+        { "encode_max_depth", qpack_cfg_encode_max_depth },
+        { "decode_max_depth", qpack_cfg_decode_max_depth },
+        { "encode_empty_table_as_array", qpack_cfg_encode_empty_tables_as_array },
         { "new", lua_qpack_new },
         { NULL, NULL }
     };
-
-    /* Initialise number conversions */
-    fpconv_init();
 
     /* qpack module table */
     lua_newtable(l);
