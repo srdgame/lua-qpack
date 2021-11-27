@@ -404,6 +404,7 @@ static int qpack_process_obj(lua_State *l, qpack_parse_t *pk,
         qp_unpacker_t *up, qp_obj_t *obj)
 {
     int ret = 0;
+    // printf("%s: tp %d\n", __func__, obj->tp);
 
     switch (obj->tp) {
     case QP_ERR:
@@ -438,8 +439,9 @@ static int qpack_process_obj(lua_State *l, qpack_parse_t *pk,
     case QP_ARRAY4:
     case QP_ARRAY5:
     {
+        size_t total = obj->tp - QP_ARRAY0;
         lua_newtable(l);
-        for (int i = 1; i <= obj->tp - QP_ARRAY0; i++)
+        for (int i = 1; i <= total; i++)
         {
             qp_next(up, obj);
             ret = qpack_process_obj(l, pk, up, obj);
@@ -456,9 +458,11 @@ static int qpack_process_obj(lua_State *l, qpack_parse_t *pk,
     case QP_MAP4:
     case QP_MAP5:
     {
+        size_t i = obj->tp - QP_MAP0;
+
         lua_newtable(l);
 
-        for (int i = 0; i < obj->tp - QP_MAP0; i++)
+        while (i--)
         {
             qp_next(up, obj);
             ret = qpack_process_obj(l, pk, up, obj);
