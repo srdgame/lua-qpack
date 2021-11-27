@@ -193,7 +193,7 @@ static int qpack_append_string(lua_State *l, qp_packer_t *pk, int lindex)
     str = lua_tolstring(l, lindex, &len);
     // printf("%s: append string:%s len:%lu\n", __func__, str, len);
 
-    return qp_add_string_term_n(pk, str, len);
+    return qp_add_raw(pk, (const unsigned char*)str, len);
 }
 
 /* Find the size of the array on the top of the Lua stack
@@ -426,7 +426,7 @@ static int qpack_process_obj(lua_State *l, qpack_parse_t *pk,
         lua_pushboolean(l, 0);
         break;
     case QP_RAW:
-        lua_pushlstring(l, (const char*)obj->via.raw, obj->len - 1);
+        lua_pushlstring(l, (const char*)obj->via.raw, obj->len);
         break;
     case QP_NULL:
         lua_pushlightuserdata(l, NULL);
