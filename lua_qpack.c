@@ -440,8 +440,9 @@ static int qpack_process_obj(lua_State *l, qpack_parse_t *pk,
     case QP_ARRAY5:
     {
         size_t total = obj->tp - QP_ARRAY0;
+        int i;
         lua_newtable(l);
-        for (int i = 1; i <= total; i++)
+        for (i = 1; i <= total; i++)
         {
             qp_next(up, obj);
             ret = qpack_process_obj(l, pk, up, obj);
