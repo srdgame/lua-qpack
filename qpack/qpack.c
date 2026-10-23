@@ -130,6 +130,36 @@ if (unpacker->pt + size > unpacker->end)    \
     return QP_ERR;                          \
 }
 
+#if defined(_WIN32)
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+static int vasprintf(char **strp, const char *fmt, va_list ap) {
+    // 1. 计算所需长度（不含结尾 '\0'）
+    int len = _vscprintf(fmt, ap);
+    if (len == -1) {
+        return -1;
+    }
+
+    // 2. 分配足够内存
+    size_t size = (size_t)len + 1;
+    char *str = (char *)malloc(size);
+    if (!str) {
+        return -1;
+    }
+
+    // 3. 写入格式化结果
+    int r = vsprintf_s(str, size, fmt, ap);
+    if (r == -1) {
+        free(str);
+        return -1;
+    }
+
+    *strp = str;
+    return r;
+}
+#endif
+
 static qp_types_t QP_print_unpacker(
         qp_types_t tp,
         qp_unpacker_t * unpacker,
